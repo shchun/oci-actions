@@ -154,8 +154,11 @@ jobs:
               exit 0
             fi
 
-            if grep -qi "Out of host capacity\|LimitExceeded\|TooManyRequests\|429\|500\|InternalError" /tmp/launch.err; then
-              echo "Capacity/throttling error on attempt $attempt."
+            # Retry on capacity, throttling, and transient network errors.
+            # (A bare connection timeout is transient — it must not be treated
+            # as a fatal config error, or the loop reports a false red failure.)
+            if grep -qi "Out of host capacity\|LimitExceeded\|TooManyRequests\|429\|500\|InternalError\|timed out\|timeout\|RequestException\|ConnectionError\|Could not connect\|ServiceUnavailable\|502\|503\|504" /tmp/launch.err; then
+              echo "Capacity/throttling/transient error on attempt $attempt."
               if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
                 echo "Retrying in ${RETRY_DELAY}s..."
                 sleep "$RETRY_DELAY"
@@ -207,7 +210,7 @@ jobs:
               echo "| Instance ID | \`${INSTANCE_ID}\` |"
               echo "| Public IP | \`${PUBLIC_IP}\` |"
             elif [ "$LAUNCH_STATUS" = "capacity_exhausted" ]; then
-              echo "⏳ **No capacity this run** — Oracle had no free ARM capacity. Will try again next cron tick. *(The green check just means the run finished cleanly, not that a VM was created.)*"
+              echo "⏳ **Not created this run** — no free ARM capacity (or a transient OCI/network error). Will try again next cron tick. *(The green check just means the run finished cleanly, not that a VM was created.)*"
             else
               echo "❌ **Failed** — status: \`${LAUNCH_STATUS:-unknown}\`. See the *Launch instance* step logs above."
             fi

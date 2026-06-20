@@ -26,9 +26,9 @@ on:
         required: false
         default: "24"
       boot_volume_size_gb:
-        description: "Boot volume size in GB (min 50)"
+        description: "Boot volume size in GB (min 50, free tier max 200)"
         required: false
-        default: "50"
+        default: "200"
       max_attempts:
         description: "Retry attempts on 'Out of host capacity'"
         required: false
@@ -84,7 +84,7 @@ jobs:
           DISPLAY_NAME: ${{ github.event.inputs.display_name || 'gha-instance' }}
           OCPUS: ${{ github.event.inputs.ocpus || '4' }}
           MEMORY: ${{ github.event.inputs.memory_in_gbs || '24' }}
-          BOOT_VOL: ${{ github.event.inputs.boot_volume_size_gb || '50' }}
+          BOOT_VOL: ${{ github.event.inputs.boot_volume_size_gb || '200' }}
           MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts || '30' }}
           RETRY_DELAY: ${{ github.event.inputs.retry_delay_seconds || '60' }}
         run: |

@@ -38,6 +38,10 @@ on:
         description: "Seconds to wait between retries"
         required: false
         default: "60"
+      quiet:
+        description: "Stay silent on Slack for 'no capacity' outcomes (the VM cron sets this to true)"
+        required: false
+        default: "false"
   schedule:
     # Every 10 minutes. Scheduled runs do a single attempt (the cron is the retry).
     - cron: "*/10 * * * *"
@@ -180,12 +184,42 @@ jobs:
           echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
           echo "Public IP: $PUBLIC_IP"
 
+      - name: Job summary
+        if: always()
+        env:
+          EXISTS: ${{ steps.check.outputs.exists }}
+          LAUNCH_STATUS: ${{ steps.launch.outputs.status }}
+          INSTANCE_ID: ${{ steps.launch.outputs.instance_id }}
+          PUBLIC_IP: ${{ steps.ip.outputs.public_ip }}
+          DISPLAY_NAME: ${{ env.DISPLAY_NAME }}
+        run: |
+          set -u
+          {
+            echo "## OCI VM creation result"
+            echo ""
+            if [ "$EXISTS" = "true" ]; then
+              echo "ℹ️ **Skipped** — an instance named \`${DISPLAY_NAME}\` is already live."
+            elif [ "$LAUNCH_STATUS" = "success" ]; then
+              echo "✅ **Created** \`${DISPLAY_NAME}\`"
+              echo ""
+              echo "| Field | Value |"
+              echo "| --- | --- |"
+              echo "| Instance ID | \`${INSTANCE_ID}\` |"
+              echo "| Public IP | \`${PUBLIC_IP}\` |"
+            elif [ "$LAUNCH_STATUS" = "capacity_exhausted" ]; then
+              echo "⏳ **No capacity this run** — Oracle had no free ARM capacity. Will try again next cron tick. *(The green check just means the run finished cleanly, not that a VM was created.)*"
+            else
+              echo "❌ **Failed** — status: \`${LAUNCH_STATUS:-unknown}\`. See the *Launch instance* step logs above."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Notify Slack
         if: always()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           EXISTS: ${{ steps.check.outputs.exists }}
           EVENT: ${{ github.event_name }}
+          QUIET: ${{ github.event.inputs.quiet || 'false' }}
           LAUNCH_STATUS: ${{ steps.launch.outputs.status }}
           INSTANCE_ID: ${{ steps.launch.outputs.instance_id }}
           PUBLIC_IP: ${{ steps.ip.outputs.public_ip }}
@@ -199,8 +233,11 @@ jobs:
             echo "Instance already exists; no Slack notification."
             exit 0
           fi
-          if [ "$LAUNCH_STATUS" = "capacity_exhausted" ] && [ "$EVENT" = "schedule" ]; then
-            echo "No capacity on scheduled run; staying quiet."
+          # "No capacity" is the normal, expected outcome on an automated loop,
+          # so stay quiet for scheduled runs and for cron-driven dispatches
+          # (the VM cron passes quiet=true). Manual runs still get a heads-up.
+          if [ "$LAUNCH_STATUS" = "capacity_exhausted" ] && { [ "$EVENT" = "schedule" ] || [ "$QUIET" = "true" ]; }; then
+            echo "No capacity on automated run; staying quiet."
             exit 0
           fi
 

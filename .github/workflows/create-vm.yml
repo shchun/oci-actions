@@ -1,8 +1,9 @@
 name: Create OCI VM
 
 # Creates an Oracle Cloud "Always Free" ARM instance (VM.Standard.A1.Flex).
-# Because free ARM capacity is scarce, the launch step retries on
-# "Out of host capacity" errors and reports the result to Slack.
+# Free ARM capacity is scarce, so a scheduled run retries every 10 minutes
+# until capacity is available, then reports success to Slack. A guard skips
+# creation when the instance already exists, so it is safe to run on a loop.
 #
 # Required GitHub repository secrets (values come from your .env / .env.example):
 #   OCI_USER_OCID, OCI_TENANCY_OCID, OCI_REGION, OCI_FINGERPRINT,
@@ -30,20 +31,27 @@ on:
         required: false
         default: "200"
       max_attempts:
-        description: "Retry attempts on 'Out of host capacity'"
+        description: "Retry attempts on capacity errors (manual runs)"
         required: false
         default: "30"
       retry_delay_seconds:
         description: "Seconds to wait between retries"
         required: false
         default: "60"
-  # Uncomment to keep retrying on a schedule until capacity is available.
-  # schedule:
-  #   - cron: "*/30 * * * *"
+  schedule:
+    # Every 10 minutes. Scheduled runs do a single attempt (the cron is the retry).
+    - cron: "*/10 * * * *"
+
+# Never let two runs launch at the same time (prevents creating duplicates).
+concurrency:
+  group: create-oci-vm
+  cancel-in-progress: false
 
 jobs:
   create-vm:
     runs-on: ubuntu-latest
+    env:
+      DISPLAY_NAME: ${{ github.event.inputs.display_name || 'gha-instance' }}
     steps:
       - name: Install OCI CLI
         run: |
@@ -61,19 +69,40 @@ jobs:
           mkdir -p ~/.oci
           printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
-          cat > ~/.oci/config <<CONFIG
-          [DEFAULT]
-          user=${OCI_USER_OCID}
-          fingerprint=${OCI_FINGERPRINT}
-          tenancy=${OCI_TENANCY_OCID}
-          region=${OCI_REGION}
-          key_file=/home/runner/.oci/oci_api_key.pem
-          CONFIG
+          {
+            echo "[DEFAULT]"
+            echo "user=$OCI_USER_OCID"
+            echo "fingerprint=$OCI_FINGERPRINT"
+            echo "tenancy=$OCI_TENANCY_OCID"
+            echo "region=$OCI_REGION"
+            echo "key_file=/home/runner/.oci/oci_api_key.pem"
+          } > ~/.oci/config
           chmod 600 ~/.oci/config
           oci setup repair-file-permissions --file ~/.oci/config || true
 
+      - name: Check for existing instance
+        id: check
+        env:
+          COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+        run: |
+          set -uo pipefail
+          if ! oci compute instance list --compartment-id "$COMPARTMENT_OCID" --all > /tmp/list.json 2>/tmp/list.err; then
+            echo "Could not list instances; assuming none exist."
+            cat /tmp/list.err || true
+            echo '{"data":[]}' > /tmp/list.json
+          fi
+          COUNT=$(jq --arg n "$DISPLAY_NAME" '[ .data[]? | select(.["display-name"] == $n) | select(.["lifecycle-state"] == "RUNNING" or .["lifecycle-state"] == "PROVISIONING" or .["lifecycle-state"] == "STARTING") ] | length' /tmp/list.json)
+          if [ "${COUNT:-0}" -gt 0 ]; then
+            echo "An instance named [$DISPLAY_NAME] already exists; skipping launch."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No live instance named [$DISPLAY_NAME]; will attempt to launch."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Launch instance (retry on capacity errors)
         id: launch
+        if: steps.check.outputs.exists != 'true'
         env:
           COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
           AD: ${{ secrets.OCI_AD }}
@@ -81,11 +110,11 @@ jobs:
           SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
           IMAGE_OCID: ${{ secrets.OCI_IMAGE_OCID }}
           SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
-          DISPLAY_NAME: ${{ github.event.inputs.display_name || 'gha-instance' }}
           OCPUS: ${{ github.event.inputs.ocpus || '4' }}
           MEMORY: ${{ github.event.inputs.memory_in_gbs || '24' }}
           BOOT_VOL: ${{ github.event.inputs.boot_volume_size_gb || '200' }}
-          MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts || '30' }}
+          # Scheduled runs do a single attempt; the cron is the retry loop.
+          MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts || '1' }}
           RETRY_DELAY: ${{ github.event.inputs.retry_delay_seconds || '60' }}
         run: |
           set -uo pipefail
@@ -94,6 +123,9 @@ jobs:
           attempt=1
           while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
             echo "::group::Launch attempt $attempt / $MAX_ATTEMPTS"
+            # The trailing "|| code=..." stops bash -e from aborting the step on
+            # failure, so we can read the error and decide whether to retry.
+            code=0
             oci compute instance launch \
               --compartment-id "$COMPARTMENT_OCID" \
               --availability-domain "$AD" \
@@ -106,8 +138,7 @@ jobs:
               --boot-volume-size-in-gbs "$BOOT_VOL" \
               --ssh-authorized-keys-file /tmp/ssh_authorized_keys.pub \
               --wait-for-state RUNNING \
-              > /tmp/launch.out 2> /tmp/launch.err
-            code=$?
+              > /tmp/launch.out 2> /tmp/launch.err || code=$?
             cat /tmp/launch.err || true
             echo "::endgroup::"
 
@@ -119,31 +150,33 @@ jobs:
               exit 0
             fi
 
-            if grep -qi "Out of host capacity\|LimitExceeded\|TooManyRequests\|429" /tmp/launch.err; then
-              echo "Capacity/throttling error on attempt $attempt; retrying in ${RETRY_DELAY}s..."
-              sleep "$RETRY_DELAY"
+            if grep -qi "Out of host capacity\|LimitExceeded\|TooManyRequests\|429\|500\|InternalError" /tmp/launch.err; then
+              echo "Capacity/throttling error on attempt $attempt."
+              if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+                echo "Retrying in ${RETRY_DELAY}s..."
+                sleep "$RETRY_DELAY"
+              fi
               attempt=$((attempt + 1))
               continue
             fi
 
-            echo "Non-retryable error:"
-            cat /tmp/launch.err
+            echo "Non-retryable error (see above)."
             echo "status=failed" >> "$GITHUB_OUTPUT"
             exit 1
           done
 
-          echo "Exhausted $MAX_ATTEMPTS attempts without acquiring capacity."
+          # Capacity still unavailable. Treat as a soft outcome (exit 0) so the
+          # Actions history is not flooded with red failures every 10 minutes.
+          echo "No capacity this run; will try again next schedule."
           echo "status=capacity_exhausted" >> "$GITHUB_OUTPUT"
-          exit 1
+          exit 0
 
       - name: Get public IP
         id: ip
         if: steps.launch.outputs.status == 'success'
         run: |
           set -euo pipefail
-          PUBLIC_IP=$(oci compute instance list-vnics \
-            --instance-id "${{ steps.launch.outputs.instance_id }}" \
-            --query 'data[0]."public-ip"' --raw-output)
+          PUBLIC_IP=$(oci compute instance list-vnics --instance-id "${{ steps.launch.outputs.instance_id }}" --query 'data[0]."public-ip"' --raw-output)
           echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
           echo "Public IP: $PUBLIC_IP"
 
@@ -151,19 +184,32 @@ jobs:
         if: always()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          EXISTS: ${{ steps.check.outputs.exists }}
+          EVENT: ${{ github.event_name }}
+          LAUNCH_STATUS: ${{ steps.launch.outputs.status }}
+          INSTANCE_ID: ${{ steps.launch.outputs.instance_id }}
+          PUBLIC_IP: ${{ steps.ip.outputs.public_ip }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -u
-          launch_status="${{ steps.launch.outputs.status }}"
-          instance_id="${{ steps.launch.outputs.instance_id }}"
-          public_ip="${{ steps.ip.outputs.public_ip }}"
-          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-          if [ "${{ job.status }}" = "success" ] && [ "$launch_status" = "success" ]; then
-            text=":white_check_mark: *OCI VM created* \`${{ github.event.inputs.display_name || 'gha-instance' }}\`\nInstance: \`${instance_id}\`\nPublic IP: \`${public_ip}\`\n<${run_url}|View run>"
-          elif [ "$launch_status" = "capacity_exhausted" ]; then
-            text=":hourglass_flowing_sand: *OCI VM creation gave up* — out of host capacity after all retries.\n<${run_url}|View run>"
+          # Stay silent on routine "nothing to do" outcomes so a 10-minute
+          # schedule does not spam Slack.
+          if [ "$EXISTS" = "true" ]; then
+            echo "Instance already exists; no Slack notification."
+            exit 0
+          fi
+          if [ "$LAUNCH_STATUS" = "capacity_exhausted" ] && [ "$EVENT" = "schedule" ]; then
+            echo "No capacity on scheduled run; staying quiet."
+            exit 0
+          fi
+
+          if [ "$LAUNCH_STATUS" = "success" ]; then
+            text=":white_check_mark: *OCI VM created* [${DISPLAY_NAME}]\nInstance: ${INSTANCE_ID}\nPublic IP: ${PUBLIC_IP}\n<${RUN_URL}|View run>"
+          elif [ "$LAUNCH_STATUS" = "capacity_exhausted" ]; then
+            text=":hourglass_flowing_sand: *OCI VM not created* - out of host capacity after all retries.\n<${RUN_URL}|View run>"
           else
-            text=":x: *OCI VM creation failed*\nStatus: \`${launch_status:-unknown}\`\n<${run_url}|View run>"
+            text=":x: *OCI VM creation failed*\nStatus: ${LAUNCH_STATUS:-unknown}\n<${RUN_URL}|View run>"
           fi
 
           if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then

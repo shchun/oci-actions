@@ -1,0 +1,174 @@
+name: Create OCI VM
+
+# Creates an Oracle Cloud "Always Free" ARM instance (VM.Standard.A1.Flex).
+# Because free ARM capacity is scarce, the launch step retries on
+# "Out of host capacity" errors and reports the result to Slack.
+#
+# Required GitHub repository secrets (values come from your .env / .env.example):
+#   OCI_USER_OCID, OCI_TENANCY_OCID, OCI_REGION, OCI_FINGERPRINT,
+#   OCI_PRIVATE_KEY (full PEM text), OCI_SUBNET_OCID, OCI_IMAGE_OCID,
+#   OCI_SSH_PUBLIC_KEY (full public key text), OCI_COMPARTMENT_OCID,
+#   OCI_AD, OCI_SHAPE, SLACK_WEBHOOK_URL
+
+on:
+  workflow_dispatch:
+    inputs:
+      display_name:
+        description: "Instance display name"
+        required: false
+        default: "gha-instance"
+      ocpus:
+        description: "OCPUs for A1.Flex (free tier max total: 4)"
+        required: false
+        default: "4"
+      memory_in_gbs:
+        description: "Memory in GBs for A1.Flex (free tier max total: 24)"
+        required: false
+        default: "24"
+      boot_volume_size_gb:
+        description: "Boot volume size in GB (min 50)"
+        required: false
+        default: "50"
+      max_attempts:
+        description: "Retry attempts on 'Out of host capacity'"
+        required: false
+        default: "30"
+      retry_delay_seconds:
+        description: "Seconds to wait between retries"
+        required: false
+        default: "60"
+  # Uncomment to keep retrying on a schedule until capacity is available.
+  # schedule:
+  #   - cron: "*/30 * * * *"
+
+jobs:
+  create-vm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install OCI CLI
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install oci-cli
+
+      - name: Configure OCI CLI
+        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat > ~/.oci/config <<CONFIG
+          [DEFAULT]
+          user=${OCI_USER_OCID}
+          fingerprint=${OCI_FINGERPRINT}
+          tenancy=${OCI_TENANCY_OCID}
+          region=${OCI_REGION}
+          key_file=/home/runner/.oci/oci_api_key.pem
+          CONFIG
+          chmod 600 ~/.oci/config
+          oci setup repair-file-permissions --file ~/.oci/config || true
+
+      - name: Launch instance (retry on capacity errors)
+        id: launch
+        env:
+          COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          AD: ${{ secrets.OCI_AD }}
+          SHAPE: ${{ secrets.OCI_SHAPE }}
+          SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
+          IMAGE_OCID: ${{ secrets.OCI_IMAGE_OCID }}
+          SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+          DISPLAY_NAME: ${{ github.event.inputs.display_name || 'gha-instance' }}
+          OCPUS: ${{ github.event.inputs.ocpus || '4' }}
+          MEMORY: ${{ github.event.inputs.memory_in_gbs || '24' }}
+          BOOT_VOL: ${{ github.event.inputs.boot_volume_size_gb || '50' }}
+          MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts || '30' }}
+          RETRY_DELAY: ${{ github.event.inputs.retry_delay_seconds || '60' }}
+        run: |
+          set -uo pipefail
+          printf '%s\n' "$SSH_PUBLIC_KEY" > /tmp/ssh_authorized_keys.pub
+
+          attempt=1
+          while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+            echo "::group::Launch attempt $attempt / $MAX_ATTEMPTS"
+            oci compute instance launch \
+              --compartment-id "$COMPARTMENT_OCID" \
+              --availability-domain "$AD" \
+              --shape "$SHAPE" \
+              --shape-config "{\"ocpus\": $OCPUS, \"memoryInGBs\": $MEMORY}" \
+              --subnet-id "$SUBNET_OCID" \
+              --image-id "$IMAGE_OCID" \
+              --display-name "$DISPLAY_NAME" \
+              --assign-public-ip true \
+              --boot-volume-size-in-gbs "$BOOT_VOL" \
+              --ssh-authorized-keys-file /tmp/ssh_authorized_keys.pub \
+              --wait-for-state RUNNING \
+              > /tmp/launch.out 2> /tmp/launch.err
+            code=$?
+            cat /tmp/launch.err || true
+            echo "::endgroup::"
+
+            if [ "$code" -eq 0 ]; then
+              echo "Instance launched successfully."
+              INSTANCE_ID=$(jq -r '.data.id' /tmp/launch.out)
+              echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+              echo "status=success" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if grep -qi "Out of host capacity\|LimitExceeded\|TooManyRequests\|429" /tmp/launch.err; then
+              echo "Capacity/throttling error on attempt $attempt; retrying in ${RETRY_DELAY}s..."
+              sleep "$RETRY_DELAY"
+              attempt=$((attempt + 1))
+              continue
+            fi
+
+            echo "Non-retryable error:"
+            cat /tmp/launch.err
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          done
+
+          echo "Exhausted $MAX_ATTEMPTS attempts without acquiring capacity."
+          echo "status=capacity_exhausted" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Get public IP
+        id: ip
+        if: steps.launch.outputs.status == 'success'
+        run: |
+          set -euo pipefail
+          PUBLIC_IP=$(oci compute instance list-vnics \
+            --instance-id "${{ steps.launch.outputs.instance_id }}" \
+            --query 'data[0]."public-ip"' --raw-output)
+          echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
+          echo "Public IP: $PUBLIC_IP"
+
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          set -u
+          launch_status="${{ steps.launch.outputs.status }}"
+          instance_id="${{ steps.launch.outputs.instance_id }}"
+          public_ip="${{ steps.ip.outputs.public_ip }}"
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "${{ job.status }}" = "success" ] && [ "$launch_status" = "success" ]; then
+            text=":white_check_mark: *OCI VM created* \`${{ github.event.inputs.display_name || 'gha-instance' }}\`\nInstance: \`${instance_id}\`\nPublic IP: \`${public_ip}\`\n<${run_url}|View run>"
+          elif [ "$launch_status" = "capacity_exhausted" ]; then
+            text=":hourglass_flowing_sand: *OCI VM creation gave up* — out of host capacity after all retries.\n<${run_url}|View run>"
+          else
+            text=":x: *OCI VM creation failed*\nStatus: \`${launch_status:-unknown}\`\n<${run_url}|View run>"
+          fi
+
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "SLACK_WEBHOOK_URL not set; skipping Slack notification."
+            exit 0
+          fi
+          payload=$(jq -n --arg t "$text" '{text: $t}')
+          curl -fsS -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"

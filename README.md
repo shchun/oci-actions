@@ -5,7 +5,12 @@ via a GitHub Actions workflow. Free ARM capacity is scarce, so the workflow is
 designed to run on a loop and retry until capacity is available, then report to
 Slack.
 
-- Workflow: [.github/workflows/create-vm.yml](.github/workflows/create-vm.yml)
+This repo is a self-contained unit — workflow, trigger script, deploy agent,
+and docs all version together:
+
+- Workflow (the receiving end): [.github/workflows/create-vm.yml](.github/workflows/create-vm.yml)
+- Trigger script (the sending end, source of truth): [trigger.sh](trigger.sh)
+- Deploy agent (installs the trigger on the VM): [.claude/agents/oci-trigger-deployer.md](.claude/agents/oci-trigger-deployer.md)
 - Secrets template: [.env.example](.env.example)
 
 ## How it works
@@ -67,7 +72,9 @@ The VM runs this from `crontab -l`:
 */10 * * * * /home/ubuntu/oci-vm-trigger/trigger.sh
 ```
 
-`~/oci-vm-trigger/trigger.sh`:
+The script deployed to `~/oci-vm-trigger/trigger.sh` is the git-tracked
+[trigger.sh](trigger.sh) in this repo (source of truth — edit there, commit,
+redeploy with the `oci-trigger-deployer` agent):
 
 ```bash
 #!/usr/bin/env bash
@@ -133,3 +140,13 @@ tail -f ~/oci-vm-trigger/trigger.log    # expect: ...dispatch -> HTTP 204 every 
 
 `HTTP 204` = accepted. Anything else (401/403/404) means a token or
 repo/workflow-name problem.
+
+### 3. Deploying the trigger to the VM
+
+Use the **`oci-trigger-deployer`** agent
+([.claude/agents/oci-trigger-deployer.md](.claude/agents/oci-trigger-deployer.md)).
+Given the VM's public IP and SSH key path, it `scp`s [trigger.sh](trigger.sh)
+to `~/oci-vm-trigger/trigger.sh`, ensures the token file exists, installs the
+`*/10` crontab entry (without clobbering other cron jobs), and verifies the
+first dispatch returns `HTTP 204`. The VM's public IP changes on reboot, so it
+is passed at invocation time rather than hardcoded.

@@ -57,6 +57,24 @@ jobs:
     env:
       DISPLAY_NAME: ${{ github.event.inputs.display_name || 'gha-instance' }}
     steps:
+      - name: Print request parameters
+        env:
+          OCPUS: ${{ github.event.inputs.ocpus || '2' }}
+          MEMORY: ${{ github.event.inputs.memory_in_gbs || '12' }}
+          BOOT_VOL: ${{ github.event.inputs.boot_volume_size_gb || '200' }}
+          MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts || '1' }}
+          RETRY_DELAY: ${{ github.event.inputs.retry_delay_seconds || '60' }}
+          QUIET: ${{ github.event.inputs.quiet || 'false' }}
+        run: |
+          echo "Triggered by : ${{ github.event_name }}"
+          echo "display_name : ${DISPLAY_NAME}"
+          echo "ocpus        : ${OCPUS}"
+          echo "memory_in_gbs: ${MEMORY}"
+          echo "boot_vol_gb  : ${BOOT_VOL}"
+          echo "max_attempts : ${MAX_ATTEMPTS}"
+          echo "retry_delay  : ${RETRY_DELAY}"
+          echo "quiet        : ${QUIET}"
+
       - name: Install OCI CLI
         run: |
           python3 -m pip install --upgrade pip

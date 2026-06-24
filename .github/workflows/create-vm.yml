@@ -19,13 +19,13 @@ on:
         required: false
         default: "gha-instance"
       ocpus:
-        description: "OCPUs for A1.Flex (free tier max total: 4)"
+        description: "OCPUs for A1.Flex (free tier max total: 2)"
         required: false
-        default: "4"
+        default: "2"
       memory_in_gbs:
-        description: "Memory in GBs for A1.Flex (free tier max total: 24)"
+        description: "Memory in GBs for A1.Flex (free tier max total: 12)"
         required: false
-        default: "24"
+        default: "12"
       boot_volume_size_gb:
         description: "Boot volume size in GB (min 50, free tier max 200)"
         required: false
@@ -114,8 +114,8 @@ jobs:
           SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
           IMAGE_OCID: ${{ secrets.OCI_IMAGE_OCID }}
           SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
-          OCPUS: ${{ github.event.inputs.ocpus || '4' }}
-          MEMORY: ${{ github.event.inputs.memory_in_gbs || '24' }}
+          OCPUS: ${{ github.event.inputs.ocpus || '2' }}
+          MEMORY: ${{ github.event.inputs.memory_in_gbs || '12' }}
           BOOT_VOL: ${{ github.event.inputs.boot_volume_size_gb || '200' }}
           # Scheduled runs do a single attempt; the cron is the retry loop.
           MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts || '1' }}
